@@ -6,11 +6,34 @@ import { scanAllPools } from "./poolScanner";
 import { optimizePaths } from "./pathOptimizer";
 import { findOpportunities } from "./opportunityFinder";
 
+// === Step 5 additions ===
+import {
+  buildArbPlanForOpportunity
+} from "./executors/executorBridge";
+
+import {
+  executeBestOpportunity
+} from "./executors/txExecutor";
+
 // -------------------------
 // ENV + Provider
 // -------------------------
 const RPC_URL = process.env.RPC_URL || "https://bsc-dataseed.binance.org";
 const provider = new ethers.JsonRpcProvider(RPC_URL);
+
+const PRIVATE_KEY = process.env.PRIVATE_KEY || "";
+const ARB_CONTRACT = process.env.ARB_CONTRACT || "";
+const BENEFICIARY = process.env.BENEFICIARY || "";
+
+// Set ENABLE_EXECUTION=false to disable sending real txs
+const ENABLE_EXECUTION =
+  (process.env.ENABLE_EXECUTION || "false").toLowerCase() === "true";
+
+if (!ENABLE_EXECUTION) {
+  console.log("⚠️  EXECUTION DISABLED — running in scan-only mode");
+} else {
+  console.log("🔥 EXECUTION ENABLED — bot will send real transactions");
+}
 
 // -------------------------
 // SCAN CONFIG
@@ -19,6 +42,10 @@ const SCAN_INTERVAL_MS = 6000; // Every 6 seconds
 const BATCH_SIZE = 75;         // RPC batch size optimized for Ankr
 const MIN_LIQ_USD = 20000;     // Pool liquidity filter
 const ENABLE_TRI = true;       // Enable triangular arbitrage scanning
+
+// Loan + Profit settings for ArbExecutor
+const LOAN_AMOUNT = 0.05 * 1e18;     // 0.05 unit of loanToken
+const MIN_PROFIT = 0.002 * 1e18;     // 0.002 minimum profit threshold
 
 // Token list will be dynamically constructed from pools
 let GLOBAL_TOKEN_LIST: string[] = [];
@@ -89,6 +116,24 @@ async function runScanLoop() {
           `💰 ${opp.type.toUpperCase()} | ${opp.tokenA}/${opp.tokenB} | ${opp.profitPct.toFixed(
             3
           )}% | via ${opp.path.join(" → ")}`
+        );
+      }
+
+      // --------------------------------------------------------
+      // STEP 5 — (NEW) Execute best opportunity
+      // --------------------------------------------------------
+      if (ENABLE_EXECUTION && opps.length > 0) {
+        console.log("⚡ Executing best available opportunity...");
+
+        await executeBestOpportunity(
+          opps,
+          RPC_URL,
+          PRIVATE_KEY,
+          ARB_CONTRACT,
+          BigInt(LOAN_AMOUNT),
+          BigInt(MIN_PROFIT),
+          BENEFICIARY,
+          buildArbPlanForOpportunity
         );
       }
 
