@@ -5,307 +5,194 @@ import type { ArbPlan } from "./executorBridge";
 import ArbExecutorABI from "../../abi/ArbExecutor.json";
 import { ROUTER_ABI } from "../../constants";
 import { SETTINGS } from "../../config/settings";
+import { SafeNonceManager } from "./nonceManager";
+import {
+  classifyError,
+  recordRouterFailure,
+  shouldBlockRouter
+} from "./executionGuard";
 
-/**
- * Convert a token amount (assumed 18 decimals) to approximate USD.
- * For now we assume the loan token and gas token are WBNB.
- * Later you can extend this to real per-token pricing/oracles.
- */
+// Utility
 function amountWeiToUsd(amountWei: bigint): number {
-  const wbnbPrice = SETTINGS.USD_PRICE_MAP.WBNB || 0;
-  return Number(amountWei) / 1e18 * wbnbPrice;
+  const price = SETTINGS.USD_PRICE_MAP.WBNB || 0;
+  return Number(amountWei) / 1e18 * price;
 }
 
-/**
- * Pre-trade validation:
- *  - For each step, calls router.getAmountsOut
- *  - Sets slippage-protected minOut
- *  - Computes final profit in tokens + USD
- *  - Enforces MIN_PROFIT_USD
- *
- * Returns:
- *  - prepared ArbPlan with amountIn/minOut filled
- *  - expectedProfitUsd (before gas)
- */
-export async function validateAndPreparePlan(
-  plan: ArbPlan,
-  provider: ethers.Provider
-): Promise<{ plan: ArbPlan; expectedProfitTokens: bigint; expectedProfitUsd: number } | null> {
-  const maxSlippage = SETTINGS.MAX_SLIPPAGE_BPS / 10_000; // e.g. 50 -> 0.005
+// ----------------------------------------------------------
+// PRE-TRADE VALIDATION (Step 6.1 & 6.3)
+// ----------------------------------------------------------
+async function validatePlan(plan: ArbPlan, provider: ethers.Provider) {
+  const maxSlippage = SETTINGS.MAX_SLIPPAGE_BPS / 10000;
+  const routerCache = new Map();
 
-  const routerCache = new Map<string, ethers.Contract>();
   const getRouter = (addr: string) => {
     const key = addr.toLowerCase();
     if (!routerCache.has(key)) {
       routerCache.set(key, new ethers.Contract(addr, ROUTER_ABI, provider));
     }
-    return routerCache.get(key)!;
+    return routerCache.get(key);
   };
 
-  let currentAmount = BigInt(plan.loanAmount.toString());
+  let amount = BigInt(plan.loanAmount.toString());
 
   for (let i = 0; i < plan.steps.length; i++) {
     const step = plan.steps[i];
+
+    if (shouldBlockRouter(step.router)) {
+      console.log(`❌ Router blacklisted: ${step.router}`);
+      return null;
+    }
+
     const router = getRouter(step.router);
 
-    const amountIn =
-      i === 0 && step.amountIn && BigInt(step.amountIn) > 0n
-        ? BigInt(step.amountIn)
-        : currentAmount;
-
-    if (amountIn <= 0n) {
-      console.warn("validateAndPreparePlan: zero amountIn at step", i);
-      return null;
-    }
-
-    let expectedOut: bigint;
     try {
-      const amounts: bigint[] = await router.getAmountsOut(amountIn, step.path);
-      expectedOut = amounts[amounts.length - 1];
+      const out = await router.getAmountsOut(amount, step.path);
+      const expectedOut = out[out.length - 1];
+
+      const minOut =
+        expectedOut - BigInt(Math.floor(Number(expectedOut) * maxSlippage));
+
+      step.amountIn = amount.toString();
+      step.minOut = minOut.toString();
+
+      amount = expectedOut;
     } catch (err) {
-      console.warn("validateAndPreparePlan: getAmountsOut failed at step", i, err);
+      console.warn("Validation getAmountsOut error:", err);
+      recordRouterFailure(step.router);
       return null;
     }
-
-    if (expectedOut <= 0n) {
-      console.warn("validateAndPreparePlan: expectedOut <= 0 at step", i);
-      return null;
-    }
-
-    // Slippage guard: minOut = expectedOut * (1 - maxSlippage)
-    const minOut =
-      expectedOut -
-      BigInt(Math.floor(Number(expectedOut) * maxSlippage));
-
-    plan.steps[i].amountIn = amountIn.toString();
-    plan.steps[i].minOut = minOut.toString();
-
-    currentAmount = expectedOut;
   }
 
-  const finalAmount = currentAmount;
+  const finalAmount = amount;
   const loanAmount = BigInt(plan.loanAmount.toString());
-  if (finalAmount <= loanAmount) {
-    console.warn("validateAndPreparePlan: no token profit after steps.");
-    return null;
-  }
+
+  if (finalAmount <= loanAmount) return null;
 
   const profitTokens = finalAmount - loanAmount;
   const profitUsd = amountWeiToUsd(profitTokens);
 
-  if (profitUsd < SETTINGS.MIN_PROFIT_USD) {
-    console.warn("validateAndPreparePlan: profit below MIN_PROFIT_USD.", {
-      profitUsd,
-      min: SETTINGS.MIN_PROFIT_USD
-    });
-    return null;
-  }
+  if (profitUsd < SETTINGS.MIN_PROFIT_USD) return null;
 
-  return {
-    plan,
-    expectedProfitTokens: profitTokens,
-    expectedProfitUsd: profitUsd
-  };
+  return { plan, profitTokens, profitUsd };
 }
 
-/**
- * Final re-check before sending the tx:
- *  - Re-runs getAmountsOut across the entire path
- *  - Recomputes final profit and ensures it has not dropped
- *    below a safety threshold (e.g. 50% of original)
- *
- * This protects against MEV / price movement between initial
- * validation and gas estimation / sending.
- */
-async function revalidatePlanBeforeSend(
-  validated: { plan: ArbPlan; expectedProfitTokens: bigint; expectedProfitUsd: number },
-  provider: ethers.Provider,
-  minRetentionRatio: number = 0.5 // final profit must be at least 50% of original expectation
-): Promise<{ finalProfitTokens: bigint; finalProfitUsd: number } | null> {
-  const { plan, expectedProfitTokens, expectedProfitUsd } = validated;
-
-  const routerCache = new Map<string, ethers.Contract>();
+// ----------------------------------------------------------
+// FINAL CHECK BEFORE SEND (Step 6.3)
+// ----------------------------------------------------------
+async function finalCheck(plan: ArbPlan, provider: ethers.Provider) {
+  const routerCache = new Map();
   const getRouter = (addr: string) => {
     const key = addr.toLowerCase();
     if (!routerCache.has(key)) {
       routerCache.set(key, new ethers.Contract(addr, ROUTER_ABI, provider));
     }
-    return routerCache.get(key)!;
+    return routerCache.get(key);
   };
 
-  let currentAmount = BigInt(plan.loanAmount.toString());
+  let amount = BigInt(plan.loanAmount.toString());
 
-  for (let i = 0; i < plan.steps.length; i++) {
-    const step = plan.steps[i];
+  for (const step of plan.steps) {
     const router = getRouter(step.router);
 
-    const amountIn =
-      i === 0 && step.amountIn && BigInt(step.amountIn) > 0n
-        ? BigInt(step.amountIn)
-        : currentAmount;
-
-    if (amountIn <= 0n) {
-      console.warn("revalidatePlanBeforeSend: zero amountIn at step", i);
-      return null;
-    }
-
-    let expectedOut: bigint;
     try {
-      const amounts: bigint[] = await router.getAmountsOut(amountIn, step.path);
-      expectedOut = amounts[amounts.length - 1];
+      const out = await router.getAmountsOut(amount, step.path);
+      amount = out[out.length - 1];
     } catch (err) {
-      console.warn("revalidatePlanBeforeSend: getAmountsOut failed at step", i, err);
+      console.log("❌ Final check router failed:", step.router);
+      recordRouterFailure(step.router);
       return null;
     }
-
-    if (expectedOut <= 0n) {
-      console.warn("revalidatePlanBeforeSend: expectedOut <= 0 at step", i);
-      return null;
-    }
-
-    currentAmount = expectedOut;
   }
 
-  const finalAmount = currentAmount;
-  const loanAmount = BigInt(plan.loanAmount.toString());
-  if (finalAmount <= loanAmount) {
-    console.warn("revalidatePlanBeforeSend: finalAmount <= loanAmount");
-    return null;
-  }
+  const loan = BigInt(plan.loanAmount.toString());
+  if (amount <= loan) return null;
 
-  const finalProfitTokens = finalAmount - loanAmount;
-  const finalProfitUsd = amountWeiToUsd(finalProfitTokens);
+  const profitTokens = amount - loan;
+  const profitUsd = amountWeiToUsd(profitTokens);
 
-  // Ensure profit hasn't collapsed relative to original expectation
-  if (finalProfitUsd < expectedProfitUsd * minRetentionRatio) {
-    console.warn("revalidatePlanBeforeSend: profit dropped too much.", {
-      original: expectedProfitUsd,
-      final: finalProfitUsd,
-      ratio: finalProfitUsd / expectedProfitUsd
-    });
-    return null;
-  }
-
-  return { finalProfitTokens, finalProfitUsd };
+  return { profitTokens, profitUsd };
 }
 
-/**
- * Execute a validated ArbPlan if:
- *  - profit > MIN_PROFIT_USD
- *  - profit > gasCost * GAS_RISK_MULTIPLIER
- *  - final re-check (just before send) still passes
- */
+// ----------------------------------------------------------
+// MAIN EXECUTION PIPELINE (Step 6.4 Hardening)
+// ----------------------------------------------------------
 export async function executeArbPlanTx(
   plan: ArbPlan,
   rpcUrl: string,
   privateKey: string,
-  arbContract: string
-): Promise<ethers.TransactionReceipt | null> {
+  arbContractAddress: string
+) {
   const provider = new ethers.JsonRpcProvider(rpcUrl);
 
-  // 1) Initial validation + expected profit
-  const validated = await validateAndPreparePlan(plan, provider);
+  // STEP A — Validation
+  const validated = await validatePlan(plan, provider);
   if (!validated) {
-    console.log("❌ Plan failed initial validation.");
+    console.log("❌ Validation failed.");
     return null;
   }
 
-  const wallet = new ethers.Wallet(privateKey, provider);
-  const contract = new ethers.Contract(arbContract, ArbExecutorABI, wallet);
+  const nonceManager = new SafeNonceManager(provider, privateKey);
+  await nonceManager.waitReady();
 
-  // 2) Estimate gas
-  let gasLimit: bigint;
+  const wallet = new ethers.Wallet(privateKey, provider);
+  const contract = new ethers.Contract(arbContractAddress, ArbExecutorABI, wallet);
+
+  // STEP B — Gas estimate
+  let gasLimit: bigint = BigInt(SETTINGS.DEFAULT_GAS_LIMIT);
   try {
     const est = await contract.estimateGas.executeArb(validated.plan);
-    gasLimit = BigInt(Math.floor(Number(est) * 1.2));
-  } catch (e) {
-    console.warn("⚠️ Gas estimation failed, using fallback gas limit.", e);
-    gasLimit = BigInt(SETTINGS.DEFAULT_GAS_LIMIT);
-  }
+    gasLimit = BigInt(Math.floor(Number(est) * 1.25));
+  } catch (_) {}
 
   const feeData = await provider.getFeeData();
-  const gasPrice = feeData.gasPrice ?? 3_000_000_000n; // fallback 3 gwei
+  const gasPrice = feeData.gasPrice ?? 3_000_000_000n;
 
   const gasCostWei = gasLimit * gasPrice;
   const gasCostUsd = amountWeiToUsd(gasCostWei);
 
-  console.log("💰 Expected Profit (USD):", validated.expectedProfitUsd.toFixed(4));
-  console.log("⛽ Gas Cost (USD):", gasCostUsd.toFixed(4));
-
-  // 3) Require profit > gas * multiplier
-  const minProfitUsdNeeded = gasCostUsd * SETTINGS.GAS_RISK_MULTIPLIER;
-  if (validated.expectedProfitUsd < minProfitUsdNeeded) {
-    console.log(
-      "❌ Skipping trade: expected profit does not beat gas * multiplier.",
-      { expectedProfit: validated.expectedProfitUsd, minNeeded: minProfitUsdNeeded }
-    );
+  const minProfitRequired = gasCostUsd * SETTINGS.GAS_RISK_MULTIPLIER;
+  if (validated.profitUsd < minProfitRequired) {
+    console.log("❌ Profit does not exceed gas * multiplier.");
     return null;
   }
 
-  // 4) Final live re-check just before broadcasting tx
-  const rechecked = await revalidatePlanBeforeSend(validated, provider);
-  if (!rechecked) {
-    console.log("❌ Final re-check failed. Not sending transaction.");
+  // STEP C — Final validation before sending
+  const final = await finalCheck(plan, provider);
+  if (!final) {
+    console.log("❌ Final check failed.");
     return null;
   }
 
-  const netProfitAfterGasUsd = rechecked.finalProfitUsd - gasCostUsd;
-
-  console.log("📊 Final Profit (USD):", rechecked.finalProfitUsd.toFixed(4));
-  console.log("📉 Net Profit After Gas (USD):", netProfitAfterGasUsd.toFixed(4));
-
-  if (netProfitAfterGasUsd <= 0) {
-    console.log("❌ Net profit after gas is not positive. Aborting.");
+  if (final.profitUsd < minProfitRequired) {
+    console.log("❌ Price moved unfavorably before execution.");
     return null;
   }
 
-  // 5) Send the transaction
-  const tx = await contract.executeArb(validated.plan, { gasLimit });
+  // STEP D — Send transaction safely with nonce control
+  const nextNonce = await nonceManager.getNextNonce();
 
-  console.log("🚀 Sent executeArb tx:", tx.hash);
+  try {
+    const tx = await contract.executeArb(validated.plan, {
+      gasLimit,
+      gasPrice,
+      nonce: nextNonce
+    });
 
-  const receipt = await tx.wait();
-  console.log(
-    `✅ executeArb confirmed | block=${receipt.blockNumber} | status=${receipt.status}`
-  );
+    console.log("🚀 Sent Tx:", tx.hash);
 
-  return receipt;
-}
+    const receipt = await tx.wait();
+    console.log("✅ Confirmed:", receipt.hash);
 
-/**
- * Picks a "best" opportunity and executes it, going through
- * all validation + gas + final re-check logic.
- */
-export async function executeBestOpportunity(
-  opps: any[],
-  rpcUrl: string,
-  privateKey: string,
-  arbContract: string,
-  loanAmount: bigint,
-  minProfit: bigint,
-  beneficiary: string,
-  buildArbPlanForOpportunity: (
-    opp: any,
-    loanAmount: bigint,
-    minProfit: bigint,
-    beneficiary: string
-  ) => ArbPlan
-): Promise<ethers.TransactionReceipt | null> {
-  if (!opps.length) {
-    console.log("No opportunities to execute.");
+    return receipt;
+  } catch (err: any) {
+    const category = classifyError(err);
+    console.log("❌ Execution error:", category, err);
+
+    // penalize every router used in this plan
+    for (const step of plan.steps) {
+      recordRouterFailure(step.router);
+    }
+
     return null;
   }
-
-  // TODO: sort by expected profit; for now we just pick the first
-  const best = opps[0];
-  console.log("Selected opportunity:", best);
-
-  const plan = buildArbPlanForOpportunity(
-    best,
-    loanAmount,
-    minProfit,
-    beneficiary
-  );
-
-  return executeArbPlanTx(plan, rpcUrl, privateKey, arbContract);
 }
