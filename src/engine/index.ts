@@ -6,14 +6,16 @@ import { scanAllPools } from "./poolScanner";
 import { optimizePaths } from "./pathOptimizer";
 import { findOpportunities } from "./opportunityFinder";
 
-// === Step 5 additions ===
+// Step 5–6: execution
 import {
   buildArbPlanForOpportunity
 } from "./executors/executorBridge";
-
 import {
   executeBestOpportunity
 } from "./executors/txExecutor";
+
+// Step 6.5: metrics
+import { Metrics } from "./metrics";
 
 // -------------------------
 // ENV + Provider
@@ -25,7 +27,6 @@ const PRIVATE_KEY = process.env.PRIVATE_KEY || "";
 const ARB_CONTRACT = process.env.ARB_CONTRACT || "";
 const BENEFICIARY = process.env.BENEFICIARY || "";
 
-// Set ENABLE_EXECUTION=false to disable sending real txs
 const ENABLE_EXECUTION =
   (process.env.ENABLE_EXECUTION || "false").toLowerCase() === "true";
 
@@ -39,15 +40,14 @@ if (!ENABLE_EXECUTION) {
 // SCAN CONFIG
 // -------------------------
 const SCAN_INTERVAL_MS = 6000; // Every 6 seconds
-const BATCH_SIZE = 75;         // RPC batch size optimized for Ankr
-const MIN_LIQ_USD = 20000;     // Pool liquidity filter
-const ENABLE_TRI = true;       // Enable triangular arbitrage scanning
+const BATCH_SIZE = 75;
+const MIN_LIQ_USD = 20000;
+const ENABLE_TRI = true;
 
-// Loan + Profit settings for ArbExecutor
-const LOAN_AMOUNT = 0.05 * 1e18;     // 0.05 unit of loanToken
-const MIN_PROFIT = 0.002 * 1e18;     // 0.002 minimum profit threshold
+// Loan + Profit settings
+const LOAN_AMOUNT = 0.05 * 1e18;    // 0.05 unit
+const MIN_PROFIT = 0.002 * 1e18;    // 0.002 unit
 
-// Token list will be dynamically constructed from pools
 let GLOBAL_TOKEN_LIST: string[] = [];
 
 console.log("🚀 Arbitrage Engine Started");
@@ -61,30 +61,23 @@ async function runScanLoop() {
     try {
       console.log("\n\n🔍 Starting Scan...");
 
-      // --------------------------------------------------------
-      // STEP 1 — Fetch pools from all DEXes
-      // --------------------------------------------------------
+      // STEP 1 — Fetch pools
       const { pools, rpcCalls } = await scanAllPools(provider, MIN_LIQ_USD);
       console.log(`Found ${pools.length} deep pools`);
 
-      // Save token list for triangular paths
       GLOBAL_TOKEN_LIST = Array.from(
         new Set(pools.flatMap(p => [p.tokenA, p.tokenB]))
       );
       console.log(`Token universe: ${GLOBAL_TOKEN_LIST.length} tokens`);
 
-      // --------------------------------------------------------
-      // STEP 2 — Perform batched RPC reserve fetches
-      // --------------------------------------------------------
+      // STEP 2 — Batched reserves
       console.log(`Performing ${rpcCalls.length} batched RPC calls...`);
       const rpcResults = await batchRpc(provider, rpcCalls, BATCH_SIZE);
 
-      // Embed fresh reserves back into pool objects
       for (let i = 0; i < pools.length; i++) {
         const res = rpcResults[i];
         if (!res) continue;
 
-        // getReserves() → returns { r0, r1 }
         const r0 = BigInt("0x" + res.slice(2, 66));
         const r1 = BigInt("0x" + res.slice(66, 130));
 
@@ -94,22 +87,19 @@ async function runScanLoop() {
 
       console.log("Reserves updated.");
 
-      // --------------------------------------------------------
-      // STEP 3 — Build multi-hop paths (optional)
-      // --------------------------------------------------------
-      let allPaths = [];
-
+      // STEP 3 — Multi-hop paths
+      let allPaths: any[] = [];
       if (ENABLE_TRI) {
         allPaths = optimizePaths(pools, GLOBAL_TOKEN_LIST);
         console.log(`Generated ${allPaths.length} candidate pathways`);
       }
 
-      // --------------------------------------------------------
-      // STEP 4 — Find arbitrage opportunities
-      // --------------------------------------------------------
+      // STEP 4 — Opportunities
       const opps = findOpportunities(pools, allPaths);
-
       console.log(`🟢 Opportunities found: ${opps.length}`);
+
+      const directCount = opps.filter((o: any) => o.type === "DIRECT").length;
+      const triCount = opps.filter((o: any) => o.type === "TRIANGULAR").length;
 
       for (const opp of opps) {
         console.log(
@@ -119,12 +109,21 @@ async function runScanLoop() {
         );
       }
 
-      // --------------------------------------------------------
-      // STEP 5 — (NEW) Execute best opportunity
-      // --------------------------------------------------------
-      if (ENABLE_EXECUTION && opps.length > 0) {
-        console.log("⚡ Executing best available opportunity...");
+      const elapsedMs = Date.now() - scanStart;
+      const elapsedSec = elapsedMs / 1000;
+      console.log(`⏱ Scan completed in ${elapsedSec.toFixed(2)} seconds`);
 
+      // METRICS: record scan stats
+      Metrics.recordScan({
+        durationMs: elapsedMs,
+        oppsTotal: opps.length,
+        directOpps: directCount,
+        triOpps: triCount
+      });
+
+      // STEP 5 — Execute best opp (if enabled)
+      if (ENABLE_EXECUTION && opps.length > 0) {
+        console.log("⚡ Attempting execution of best opportunity...");
         await executeBestOpportunity(
           opps,
           RPC_URL,
@@ -137,8 +136,8 @@ async function runScanLoop() {
         );
       }
 
-      const elapsed = (Date.now() - scanStart) / 1000;
-      console.log(`⏱ Scan completed in ${elapsed.toFixed(2)} seconds`);
+      // METRICS: print summary line
+      Metrics.logSummary();
 
     } catch (err) {
       console.error("❌ Scan error:", err);
@@ -153,3 +152,4 @@ function sleep(ms: number) {
 }
 
 runScanLoop();
+
