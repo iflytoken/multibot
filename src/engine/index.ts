@@ -17,6 +17,9 @@ import {
 // Step 6.5: metrics
 import { Metrics } from "./metrics";
 
+// WebSocket broadcast server
+import { broadcast } from "../server";
+
 // -------------------------
 // ENV + Provider
 // -------------------------
@@ -45,8 +48,8 @@ const MIN_LIQ_USD = 20000;
 const ENABLE_TRI = true;
 
 // Loan + Profit settings
-const LOAN_AMOUNT = 0.05 * 1e18;    // 0.05 unit
-const MIN_PROFIT = 0.002 * 1e18;    // 0.002 unit
+const LOAN_AMOUNT = 0.05 * 1e18;    // 0.05 unit (adjust as needed)
+const MIN_PROFIT = 0.002 * 1e18;    // 0.002 unit (adjust as needed)
 
 let GLOBAL_TOKEN_LIST: string[] = [];
 
@@ -58,20 +61,30 @@ async function runScanLoop() {
   while (true) {
     const scanStart = Date.now();
 
-    try {
-      console.log("\n\n🔍 Starting Scan...");
+    // Broadcast log → dashboard
+    const log = (msg: string) => {
+      console.log(msg);
+      broadcast("log", { timestamp: Date.now(), msg });
+    };
 
-      // STEP 1 — Fetch pools
+    try {
+      log("\n\n🔍 Starting Scan...");
+
+      // --------------------------------------------------------
+      // STEP 1 — Fetch pools from all DEXes
+      // --------------------------------------------------------
       const { pools, rpcCalls } = await scanAllPools(provider, MIN_LIQ_USD);
-      console.log(`Found ${pools.length} deep pools`);
+      log(`Found ${pools.length} deep pools`);
 
       GLOBAL_TOKEN_LIST = Array.from(
         new Set(pools.flatMap(p => [p.tokenA, p.tokenB]))
       );
-      console.log(`Token universe: ${GLOBAL_TOKEN_LIST.length} tokens`);
+      log(`Token universe: ${GLOBAL_TOKEN_LIST.length} tokens`);
 
-      // STEP 2 — Batched reserves
-      console.log(`Performing ${rpcCalls.length} batched RPC calls...`);
+      // --------------------------------------------------------
+      // STEP 2 — Perform batched RPC reserve fetches
+      // --------------------------------------------------------
+      log(`Performing ${rpcCalls.length} batched RPC calls...`);
       const rpcResults = await batchRpc(provider, rpcCalls, BATCH_SIZE);
 
       for (let i = 0; i < pools.length; i++) {
@@ -85,35 +98,42 @@ async function runScanLoop() {
         pools[i].reserve1 = r1;
       }
 
-      console.log("Reserves updated.");
+      log("Reserves updated.");
 
-      // STEP 3 — Multi-hop paths
+      // --------------------------------------------------------
+      // STEP 3 — Build multi-hop paths (optional)
+      // --------------------------------------------------------
       let allPaths: any[] = [];
       if (ENABLE_TRI) {
         allPaths = optimizePaths(pools, GLOBAL_TOKEN_LIST);
-        console.log(`Generated ${allPaths.length} candidate pathways`);
+        log(`Generated ${allPaths.length} candidate pathways`);
       }
 
-      // STEP 4 — Opportunities
+      // --------------------------------------------------------
+      // STEP 4 — Find arbitrage opportunities
+      // --------------------------------------------------------
       const opps = findOpportunities(pools, allPaths);
-      console.log(`🟢 Opportunities found: ${opps.length}`);
+
+      log(`🟢 Opportunities found: ${opps.length}`);
+
+      // Broadcast opportunities → dashboard
+      broadcast("opportunities", opps);
 
       const directCount = opps.filter((o: any) => o.type === "DIRECT").length;
       const triCount = opps.filter((o: any) => o.type === "TRIANGULAR").length;
 
       for (const opp of opps) {
-        console.log(
-          `💰 ${opp.type.toUpperCase()} | ${opp.tokenA}/${opp.tokenB} | ${opp.profitPct.toFixed(
-            3
-          )}% | via ${opp.path.join(" → ")}`
+        log(
+          `💰 ${opp.type.toUpperCase()} | ${opp.tokenA}/${opp.tokenB} | ` +
+            `${opp.profitPct.toFixed(3)}% | via ${opp.path.join(" → ")}`
         );
       }
 
       const elapsedMs = Date.now() - scanStart;
       const elapsedSec = elapsedMs / 1000;
-      console.log(`⏱ Scan completed in ${elapsedSec.toFixed(2)} seconds`);
+      log(`⏱ Scan completed in ${elapsedSec.toFixed(2)} seconds`);
 
-      // METRICS: record scan stats
+      // METRICS: update
       Metrics.recordScan({
         durationMs: elapsedMs,
         oppsTotal: opps.length,
@@ -121,10 +141,16 @@ async function runScanLoop() {
         triOpps: triCount
       });
 
-      // STEP 5 — Execute best opp (if enabled)
+      // Broadcast metrics snapshot → dashboard
+      broadcast("metrics", Metrics.getSnapshot());
+
+      // --------------------------------------------------------
+      // STEP 5 — Execute best opportunity (if enabled)
+      // --------------------------------------------------------
       if (ENABLE_EXECUTION && opps.length > 0) {
-        console.log("⚡ Attempting execution of best opportunity...");
-        await executeBestOpportunity(
+        log("⚡ Attempting execution of best opportunity...");
+
+        const receipt = await executeBestOpportunity(
           opps,
           RPC_URL,
           PRIVATE_KEY,
@@ -134,13 +160,26 @@ async function runScanLoop() {
           BENEFICIARY,
           buildArbPlanForOpportunity
         );
+
+        if (receipt) {
+          broadcast("execution", {
+            status: "success",
+            tx: receipt.hash,
+            timestamp: Date.now()
+          });
+        }
       }
 
-      // METRICS: print summary line
+      // METRICS summary broadcast
       Metrics.logSummary();
+      broadcast("metrics", Metrics.getSnapshot());
 
     } catch (err) {
       console.error("❌ Scan error:", err);
+      broadcast("log", {
+        timestamp: Date.now(),
+        msg: "❌ Scan error: " + err
+      });
     }
 
     await sleep(SCAN_INTERVAL_MS);
@@ -152,4 +191,3 @@ function sleep(ms: number) {
 }
 
 runScanLoop();
-
