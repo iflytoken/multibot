@@ -11,26 +11,27 @@ import {
   recordRouterFailure,
   shouldBlockRouter
 } from "./executionGuard";
+import { Metrics } from "../metrics";
 
-// Utility
+// Utility: assume WBNB-priced profits & gas for now
 function amountWeiToUsd(amountWei: bigint): number {
   const price = SETTINGS.USD_PRICE_MAP.WBNB || 0;
   return Number(amountWei) / 1e18 * price;
 }
 
 // ----------------------------------------------------------
-// PRE-TRADE VALIDATION (Step 6.1 & 6.3)
+// PRE-TRADE VALIDATION
 // ----------------------------------------------------------
 async function validatePlan(plan: ArbPlan, provider: ethers.Provider) {
   const maxSlippage = SETTINGS.MAX_SLIPPAGE_BPS / 10000;
-  const routerCache = new Map();
+  const routerCache = new Map<string, ethers.Contract>();
 
   const getRouter = (addr: string) => {
     const key = addr.toLowerCase();
     if (!routerCache.has(key)) {
       routerCache.set(key, new ethers.Contract(addr, ROUTER_ABI, provider));
     }
-    return routerCache.get(key);
+    return routerCache.get(key)!;
   };
 
   let amount = BigInt(plan.loanAmount.toString());
@@ -46,7 +47,7 @@ async function validatePlan(plan: ArbPlan, provider: ethers.Provider) {
     const router = getRouter(step.router);
 
     try {
-      const out = await router.getAmountsOut(amount, step.path);
+      const out: bigint[] = await router.getAmountsOut(amount, step.path);
       const expectedOut = out[out.length - 1];
 
       const minOut =
@@ -77,16 +78,16 @@ async function validatePlan(plan: ArbPlan, provider: ethers.Provider) {
 }
 
 // ----------------------------------------------------------
-// FINAL CHECK BEFORE SEND (Step 6.3)
+// FINAL CHECK BEFORE SEND
 // ----------------------------------------------------------
 async function finalCheck(plan: ArbPlan, provider: ethers.Provider) {
-  const routerCache = new Map();
+  const routerCache = new Map<string, ethers.Contract>();
   const getRouter = (addr: string) => {
     const key = addr.toLowerCase();
     if (!routerCache.has(key)) {
       routerCache.set(key, new ethers.Contract(addr, ROUTER_ABI, provider));
     }
-    return routerCache.get(key);
+    return routerCache.get(key)!;
   };
 
   let amount = BigInt(plan.loanAmount.toString());
@@ -95,7 +96,7 @@ async function finalCheck(plan: ArbPlan, provider: ethers.Provider) {
     const router = getRouter(step.router);
 
     try {
-      const out = await router.getAmountsOut(amount, step.path);
+      const out: bigint[] = await router.getAmountsOut(amount, step.path);
       amount = out[out.length - 1];
     } catch (err) {
       console.log("❌ Final check router failed:", step.router);
@@ -114,20 +115,23 @@ async function finalCheck(plan: ArbPlan, provider: ethers.Provider) {
 }
 
 // ----------------------------------------------------------
-// MAIN EXECUTION PIPELINE (Step 6.4 Hardening)
+// MAIN EXECUTION PIPELINE (with metrics)
 // ----------------------------------------------------------
 export async function executeArbPlanTx(
   plan: ArbPlan,
   rpcUrl: string,
   privateKey: string,
   arbContractAddress: string
-) {
+): Promise<ethers.TransactionReceipt | null> {
   const provider = new ethers.JsonRpcProvider(rpcUrl);
 
-  // STEP A — Validation
+  Metrics.recordExecutionAttempt();
+
+  // A) Initial validation
   const validated = await validatePlan(plan, provider);
   if (!validated) {
     console.log("❌ Validation failed.");
+    Metrics.recordExecutionSkip("VALIDATION");
     return null;
   }
 
@@ -137,12 +141,14 @@ export async function executeArbPlanTx(
   const wallet = new ethers.Wallet(privateKey, provider);
   const contract = new ethers.Contract(arbContractAddress, ArbExecutorABI, wallet);
 
-  // STEP B — Gas estimate
+  // B) Gas estimate
   let gasLimit: bigint = BigInt(SETTINGS.DEFAULT_GAS_LIMIT);
   try {
     const est = await contract.estimateGas.executeArb(validated.plan);
     gasLimit = BigInt(Math.floor(Number(est) * 1.25));
-  } catch (_) {}
+  } catch (e) {
+    console.warn("⚠️ Gas estimation failed, using fallback.");
+  }
 
   const feeData = await provider.getFeeData();
   const gasPrice = feeData.gasPrice ?? 3_000_000_000n;
@@ -153,22 +159,36 @@ export async function executeArbPlanTx(
   const minProfitRequired = gasCostUsd * SETTINGS.GAS_RISK_MULTIPLIER;
   if (validated.profitUsd < minProfitRequired) {
     console.log("❌ Profit does not exceed gas * multiplier.");
+    Metrics.recordExecutionSkip("GAS");
     return null;
   }
 
-  // STEP C — Final validation before sending
+  // C) Final check just before send
   const final = await finalCheck(plan, provider);
   if (!final) {
     console.log("❌ Final check failed.");
+    Metrics.recordExecutionSkip("FINAL_CHECK");
     return null;
   }
 
   if (final.profitUsd < minProfitRequired) {
     console.log("❌ Price moved unfavorably before execution.");
+    Metrics.recordExecutionSkip("FINAL_CHECK");
     return null;
   }
 
-  // STEP D — Send transaction safely with nonce control
+  const netProfitAfterGasUsd = final.profitUsd - gasCostUsd;
+
+  console.log("📊 Final Profit (USD):", final.profitUsd.toFixed(4));
+  console.log("📉 Net Profit After Gas (USD):", netProfitAfterGasUsd.toFixed(4));
+
+  if (netProfitAfterGasUsd <= 0) {
+    console.log("❌ Net profit after gas is not positive. Aborting.");
+    Metrics.recordExecutionSkip("GAS");
+    return null;
+  }
+
+  // D) Send transaction with nonce control
   const nextNonce = await nonceManager.getNextNonce();
 
   try {
@@ -183,16 +203,55 @@ export async function executeArbPlanTx(
     const receipt = await tx.wait();
     console.log("✅ Confirmed:", receipt.hash);
 
+    Metrics.recordExecutionSuccess(netProfitAfterGasUsd);
+
     return receipt;
   } catch (err: any) {
     const category = classifyError(err);
     console.log("❌ Execution error:", category, err);
 
-    // penalize every router used in this plan
+    Metrics.recordExecutionFailure(category);
+
     for (const step of plan.steps) {
       recordRouterFailure(step.router);
     }
 
     return null;
   }
+}
+
+/**
+ * Select best opp and run full pipeline.
+ */
+export async function executeBestOpportunity(
+  opps: any[],
+  rpcUrl: string,
+  privateKey: string,
+  arbContract: string,
+  loanAmount: bigint,
+  minProfit: bigint,
+  beneficiary: string,
+  buildArbPlanForOpportunity: (
+    opp: any,
+    loanAmount: bigint,
+    minProfit: bigint,
+    beneficiary: string
+  ) => ArbPlan
+): Promise<ethers.TransactionReceipt | null> {
+  if (!opps.length) {
+    console.log("No opportunities to execute.");
+    return null;
+  }
+
+  const best = opps[0];
+  console.log("Selected opportunity:", best);
+
+  const plan = buildArbPlanForOpportunity(
+    best,
+    loanAmount,
+    minProfit,
+    beneficiary
+  );
+
+  return executeArbPlanTx(plan, rpcUrl, privateKey, arbContract);
 }
